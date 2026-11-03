@@ -46,6 +46,31 @@ options:
         C(labels).
     type: dict
     default: {}
+  accounts:
+    description:
+      - Read several Exoscale accounts into one inventory.
+      - Every entry selects a CLI account and may override I(zones) and
+        I(filters) for it.
+      - Hosts are tagged with C(exoscale_account) and grouped under the account
+        name.
+    type: list
+    elements: dict
+    default: []
+    suboptions:
+      account:
+        description: CLI account, as used by I(api_account).
+        type: str
+        required: true
+      api_config:
+        description: CLI configuration holding this account.
+        type: str
+      zones:
+        description: Zones to query for this account. Defaults to I(zones).
+        type: list
+        elements: str
+      filters:
+        description: Filters for this account. Defaults to I(filters).
+        type: dict
   inventory_hostname:
     description:
       - Value registered as inventory hostname.
@@ -80,8 +105,9 @@ options:
     default: true
   expand_hostvars:
     description:
-      - Fetch each instance again with C(get-instance), which adds private
-        networks and snapshots to the C(exoscale) host variable.
+      - Fetch each instance again with C(get-instance), which adds block storage
+        volumes, snapshots, SSH keys, private networks and the cloud-init
+        user-data to the C(exoscale) host variable.
       - Costs one additional API call per instance.
     type: bool
     default: false
@@ -92,7 +118,7 @@ options:
     type: bool
     default: false
 requirements:
-  - python >= 3.9
+  - python >= 3.11
   - exoscale >= 0.10.0
 extends_documentation_fragment:
   - inventory_cache
@@ -100,7 +126,8 @@ extends_documentation_fragment:
   - poto.exoscale.exoscale
 notes:
   - Every host carries the full instance description in the C(exoscale) host
-    variable and its zone in C(exoscale_zone).
+    variable, its zone in C(exoscale_zone) and, when the account is known, that
+    account in C(exoscale_account).
 """
 
 EXAMPLES = r"""
@@ -112,10 +139,10 @@ zones:
   - ch-gva-2
   - de-fra-1
 
-# credentials from the [production] section of ~/.exoscale.ini
+# credentials from the "production" account of the exo CLI configuration
 ---
 plugin: poto.exoscale.exoscale
-api_profile: production
+api_account: production
 inventory_hostname: uuid
 expand_hostvars: true
 fail_on_errors: true
@@ -128,10 +155,24 @@ keyed_groups:
     prefix: zone
 compose:
   ansible_user: "'debian' if 'Debian' in exoscale.template.name else 'ubuntu'"
+
+# two CLI accounts in one inventory, scoped independently
+---
+plugin: poto.exoscale.exoscale
+accounts:
+  - account: production
+    zones: [ch-gva-2, de-fra-1]
+  - account: staging
+    zones: [ch-gva-2]
+    filters:
+      labels: "env=staging"
 """
 
 import collections
-from typing import cast
+import hashlib
+import json
+import subprocess
+from typing import NamedTuple, cast
 
 from ansible.errors import AnsibleError, AnsibleParserError
 from ansible.inventory.data import InventoryData
@@ -151,6 +192,15 @@ from ..module_utils.exoscale import (
 API_FILTERS = ("manager_id", "manager_type", "ip_address", "labels")
 
 
+class _Scope(NamedTuple):
+    """One account to read, with the zones and filters that apply to it."""
+
+    account: str | None
+    options: dict
+    zones: list
+    filters: dict
+
+
 def _field(instance, name, default=None):
     """Read one instance attribute.
 
@@ -160,8 +210,8 @@ def _field(instance, name, default=None):
     return instance.get(name, instance.get(name.replace("_", "-"), default))
 
 
-# pyright: ansible-core declares ansible_name as str (Cacheable) and str | None
-# (Constructable), which no class combining both can satisfy.
+# ansible-core's own declarations disagree: Cacheable has `ansible_name: str`,
+# the Constructable chain has `str | None`, so no class combining both matches.
 class InventoryModule(  # pyright: ignore[reportIncompatibleVariableOverride]
     BaseInventoryPlugin, Constructable, Cacheable
 ):
@@ -222,6 +272,8 @@ class InventoryModule(  # pyright: ignore[reportIncompatibleVariableOverride]
             "exoscale": instance,
             "exoscale_zone": instance["zone"],
         }
+        if instance.get("account"):
+            host_vars["exoscale_account"] = instance["account"]
 
         if self.get_option("use_names"):
             address = instance["name"]
@@ -280,24 +332,11 @@ class InventoryModule(  # pyright: ignore[reportIncompatibleVariableOverride]
     def _groups(self, instance):
         """Groups generated from the instance attributes, before sanitisation."""
         zone = instance["zone"]
-        groups = [zone]
+        groups = [instance["account"], zone] if instance.get("account") else [zone]
 
         state = _field(instance, "state")
         if state:
             groups += [state, f"{zone}_{state}"]
-
-        instance_type = _field(instance, "instance_type") or {}
-        for attribute in ("size", "family"):
-            if instance_type.get(attribute):
-                groups.append(instance_type[attribute])
-
-        template = _field(instance, "template") or {}
-        if template.get("name"):
-            groups += [template["name"], f"{zone}_{template['name']}"]
-
-        for security_group in _field(instance, "security_groups") or []:
-            if security_group.get("name"):
-                groups.append(security_group["name"])
 
         for anti_affinity_group in _field(instance, "anti_affinity_groups") or []:
             if anti_affinity_group.get("name"):
@@ -315,8 +354,26 @@ class InventoryModule(  # pyright: ignore[reportIncompatibleVariableOverride]
         groups.append(f"instance_{instance['id']}")
         return groups
 
+    def _cache_key(self, path):
+        """Cache prefix plus the fetch options, so a config edit misses the cache."""
+        scope = {
+            name: self.get_option(name)
+            for name in (
+                "api_account",
+                "api_endpoint",
+                "accounts",
+                "expand_hostvars",
+                "filters",
+                "zones",
+            )
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(scope, sort_keys=True, default=str).encode()
+        ).hexdigest()[:8]
+        return f"{self._get_cache_prefix(path)}-{fingerprint}"
+
     def _fetch_instances(self, path, cache):
-        cache_key = self._get_cache_prefix(path)
+        cache_key = self._cache_key(path)
         user_cache_setting = self.get_option("cache")
         attempt_to_read_cache = user_cache_setting and cache
         cache_needs_update = not cache and user_cache_setting
@@ -345,21 +402,116 @@ class InventoryModule(  # pyright: ignore[reportIncompatibleVariableOverride]
         except ExoscaleError as error:
             raise AnsibleParserError(str(error)) from error
 
-    def _collect_instances(self):
-        options = dict(self._options)
-        key, secret = get_credentials(options)
-        timeout = self.get_option("api_timeout")
-        endpoint = self.get_option("api_endpoint")
-        zones = self.get_option("zones") or []
-        filters = self.get_option("filters") or {}
-        expand_hostvars = self.get_option("expand_hostvars")
-
-        unknown_filters = sorted(set(filters) - set(API_FILTERS))
-        if unknown_filters:
+    @staticmethod
+    def _account_name(entry):
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("account"), str)
+            or not entry["account"]
+        ):
             raise AnsibleParserError(
-                f"Unsupported filters: {', '.join(unknown_filters)}. Supported"
+                f"Every accounts entry needs an account name, got {entry!r}."
+            )
+
+        return entry["account"]
+
+    @staticmethod
+    def _zones(value, context):
+        """Zones as a list of names; suboptions get no conversion from Ansible."""
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list) or not all(
+            isinstance(zone, str) and zone for zone in value
+        ):
+            raise AnsibleParserError(f"zones{context} must be a list of zone names.")
+
+        return value
+
+    @staticmethod
+    def _filters(value, context):
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise AnsibleParserError(f"filters{context} must be a dictionary.")
+
+        unknown = sorted(set(value) - set(API_FILTERS))
+        if unknown:
+            raise AnsibleParserError(
+                f"Unsupported filters{context}: {', '.join(unknown)}. Supported"
                 f" filters are {', '.join(API_FILTERS)}."
             )
+
+        return value
+
+    def _scopes(self):
+        """The accounts to read: one unnamed scope, or one per I(accounts) entry."""
+        base = dict(self._options)
+        accounts = self.get_option("accounts") or []
+
+        if not accounts:
+            return [
+                _Scope(
+                    account=None,
+                    options=base,
+                    zones=self._zones(self.get_option("zones"), ""),
+                    filters=self._filters(self.get_option("filters"), ""),
+                )
+            ]
+
+        # Ansible coerces a `type: list` option, so a bare string arrives as a
+        # one-element list and is rejected by _account_name below.
+        scopes = []
+        for entry in accounts:
+            account = self._account_name(entry)
+            context = f" of account {account!r}"
+            options = dict(base)
+            options["api_account"] = account
+            api_config = entry.get("api_config")
+            if api_config:
+                if not isinstance(api_config, str):
+                    raise AnsibleParserError(
+                        f"api_config of account {account!r} must be a string."
+                    )
+                options["api_config"] = api_config
+            # an entry's own `zones: []` or `filters: {}` is a value, not a default
+            zones = entry.get("zones")
+            filters = entry.get("filters")
+            scopes.append(
+                _Scope(
+                    account=account,
+                    options=options,
+                    zones=self._zones(
+                        self.get_option("zones") if zones is None else zones, context
+                    ),
+                    filters=self._filters(
+                        self.get_option("filters") if filters is None else filters,
+                        context,
+                    ),
+                )
+            )
+
+        return scopes
+
+    def _collect_instances(self):
+        timeout = self.get_option("api_timeout")
+        endpoint = self.get_option("api_endpoint")
+        expand_hostvars = self.get_option("expand_hostvars")
+
+        instances = []
+        for scope in self._scopes():
+            instances.extend(
+                self._collect_scope(scope, endpoint, timeout, expand_hostvars)
+            )
+
+        return instances
+
+    def _collect_scope(self, scope, endpoint, timeout, expand_hostvars):
+        credentials = get_credentials(scope.options, run=self._run_secret_command)
+        endpoint = endpoint or credentials.endpoint
+        zones = scope.zones
+        label = scope.account or credentials.account
 
         if endpoint and not zones:
             raise AnsibleParserError(
@@ -368,26 +520,31 @@ class InventoryModule(  # pyright: ignore[reportIncompatibleVariableOverride]
             )
 
         if not zones:
-            zones = self._discover_zones(key, secret, timeout)
+            zones = self._discover_zones(credentials, timeout)
 
         instances = []
         for zone in zones:
             if endpoint:
                 client = get_client(
-                    key,
-                    secret,
+                    credentials.key,
+                    credentials.secret,
                     url=endpoint.replace("{zone}", zone),
                     timeout=timeout,
                 )
             else:
-                client = get_client(key, secret, zone=zone, timeout=timeout)
+                client = get_client(
+                    credentials.key, credentials.secret, zone=zone, timeout=timeout
+                )
 
-            self.display.vvv(f"Fetching Exoscale instances from zone {zone}")
+            self.display.vvv(
+                f"Fetching Exoscale instances from {label or 'account'} zone {zone}"
+            )
             try:
-                response = client.list_instances(**filters) or {}
+                response = client.list_instances(**scope.filters) or {}
             except FETCH_ERRORS as error:
                 self.display.warning(
-                    f"Fetching instances from zone {zone} failed: {error}"
+                    f"Fetching instances from {label or 'account'} zone {zone}"
+                    f" failed: {error}"
                 )
                 if self.get_option("fail_on_errors"):
                     raise
@@ -395,14 +552,30 @@ class InventoryModule(  # pyright: ignore[reportIncompatibleVariableOverride]
 
             for instance in response.get("instances") or []:
                 instance["zone"] = zone
+                if label:
+                    instance["account"] = label
                 if expand_hostvars:
-                    instance = self._expand_instance(client, instance, zone)
+                    instance = self._expand_instance(client, instance, zone, label)
                 instances.append(instance)
 
         return instances
 
-    def _discover_zones(self, key, secret, timeout):
-        client = get_client(key, secret, zone=DEFAULT_ZONE, timeout=timeout)
+    @staticmethod
+    def _run_secret_command(command):
+        """Run an exo CLI `secretCommand`, returning what it printed."""
+        try:
+            result = subprocess.run(command, check=True, capture_output=True, text=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise ExoscaleError(
+                f"The secretCommand {command[0]!r} failed: {error}"
+            ) from error
+
+        return result.stdout
+
+    def _discover_zones(self, credentials, timeout):
+        client = get_client(
+            credentials.key, credentials.secret, zone=DEFAULT_ZONE, timeout=timeout
+        )
         self.display.vvv(f"Listing Exoscale zones from {DEFAULT_ZONE}")
         try:
             response = client.list_zones() or {}
@@ -411,7 +584,7 @@ class InventoryModule(  # pyright: ignore[reportIncompatibleVariableOverride]
 
         return [zone["name"] for zone in response.get("zones") or []]
 
-    def _expand_instance(self, client, instance, zone):
+    def _expand_instance(self, client, instance, zone, account):
         try:
             detail = client.get_instance(id=instance["id"])
         except FETCH_ERRORS as error:
@@ -421,4 +594,6 @@ class InventoryModule(  # pyright: ignore[reportIncompatibleVariableOverride]
             return instance
 
         detail["zone"] = zone
+        if account:
+            detail["account"] = account
         return detail

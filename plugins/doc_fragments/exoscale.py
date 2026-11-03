@@ -13,7 +13,7 @@ options:
     description:
       - Exoscale API key.
       - Takes precedence over the C(EXOSCALE_API_KEY) environment variable and
-        over I(api_config).
+        over the CLI configuration.
     type: str
     env:
       - name: EXOSCALE_API_KEY
@@ -21,30 +21,32 @@ options:
     description:
       - Exoscale API secret.
       - Takes precedence over the C(EXOSCALE_API_SECRET) environment variable and
-        over I(api_config).
+        over the CLI configuration.
     type: str
     env:
       - name: EXOSCALE_API_SECRET
   api_config:
     description:
-      - Path to the INI file holding the credentials.
-      - Defaults to the first of C(~/.exoscale.ini) and C(./exoscale.ini) that
-        exists.
+      - Path to the C(exoscale.toml) written by C(exo config).
+      - Defaults to the CLI location for the platform, for example
+        C(~/.config/exoscale/exoscale.toml) on Linux.
     type: str
     env:
       - name: EXOSCALE_CONFIG
-  api_profile:
+  api_account:
     description:
-      - INI file section holding the credentials.
+      - Account of the CLI configuration to read the credentials from.
+      - Defaults to the C(EXOSCALE_ACCOUNT) environment variable, then to the
+        C(defaultaccount) of the configuration file.
     type: str
-    default: default
     env:
-      - name: EXOSCALE_PROFILE
+      - name: EXOSCALE_ACCOUNT
   api_timeout:
     description:
       - Timeout in seconds for API requests.
+      - Not C(EXOSCALE_TIMEOUT), which the CLI reads as a duration such as C(15s).
     type: int
     default: 30
     env:
-      - name: EXOSCALE_TIMEOUT
+      - name: EXOSCALE_INVENTORY_TIMEOUT
 """
