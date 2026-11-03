@@ -1,0 +1,106 @@
+---
+name: CI
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # weekly, to catch a new ansible-core or ansible-lint breaking us
+    - cron: "0 6 * * 1"
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  sanity:
+    name: ansible-test sanity
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # ansible-test only finds the collection below ansible_collections
+        working-directory: ansible_collections/poto/exoscale
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ansible_collections/poto/exoscale
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install ansible-core
+        run: python -m pip install --upgrade ansible-core
+      - name: Run ansible-test sanity
+        run: ansible-test sanity --python 3.13
+
+  units:
+    name: Units (${{ matrix.ansible }}, py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ansible_collections/poto/exoscale
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # the floor declared in meta/runtime.yml
+          - ansible: "2.15.*"
+            python: "3.11"
+          - ansible: latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ansible_collections/poto/exoscale
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install test dependencies
+        env:
+          ANSIBLE: ${{ matrix.ansible }}
+        run: |
+          if [ "$ANSIBLE" = latest ]; then
+              python -m pip install --upgrade ansible-core
+          else
+              python -m pip install "ansible-core==$ANSIBLE"
+          fi
+          python -m pip install --upgrade pytest exoscale
+      - name: Run the unit tests
+        run: pytest -q tests/unit
+        env:
+          # the test suite imports ansible_collections.poto.exoscale.*
+          PYTHONPATH: ${{ github.workspace }}
+          ANSIBLE_COLLECTIONS_PATH: ${{ github.workspace }}
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ansible_collections/poto/exoscale
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ansible_collections/poto/exoscale
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install linters
+        # pinned to what devenv.nix gives the pre-commit hooks
+        run: |
+          python -m pip install \
+              ruff==0.17.2 \
+              yamllint==1.37.1 \
+              ansible-lint==25.8.2
+      - name: ruff
+        run: |
+          ruff format --check .
+          ruff check .
+      - name: yamllint
+        run: yamllint --config-data relaxed --strict .
+      - name: ansible-lint
+        run: ansible-lint

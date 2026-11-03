@@ -1,0 +1,7 @@
+ancestor: null
+releases:
+  0.1.0:
+    changes:
+      release_summary: Initial release with the inventory plugin.
+    fragments: []
+    release_date: "2026-11-03"
